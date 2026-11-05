@@ -91,6 +91,12 @@
 #define MYDIAG_ID_REF_RPM     3500            /* speed for which delta_ref is extrapolated (working speed) */
 #define MYDIAG_USE_HALL_M1    1               /* read the current HALL_M1.PhaseShift for the report */
 #define MYDIAG_USE_IDREF      1               /* log mean Id reference (MCI_GetIqdref) */
+
+/* --- Hall sector diagnostics (widths of the 6 sectors, predicted angle ripple vs HALL_AVERAGING_FIFO_DEPTH) --- */
+#define MYDIAG_HALL_ENABLE    1
+#define MYDIAG_HALL_RPM_MIN   1500            /* collect only above this speed ... */
+#define MYDIAG_HALL_STEADY_RPM 150            /* ... and when |speed - speed_ref| < this */
+#define MYDIAG_HALL_REV_TOL_PCT 3             /* a revolution is used only if its period differs from the previous one by < this % */
 /* ----------------------------------- */
 
 typedef struct
@@ -728,6 +734,270 @@ static void MyDiag_IdBegin(uint8_t k)
 #define MyDiag_IdWork()                          ((void)0)
 #endif
 
+
+/* =====================================================================================
+ *  HALL SECTOR DIAGNOSTICS
+ *
+ *  With HALL_MTPA = true the library (hall_speed_pos_fdbk.c) does this:
+ *    - at EVERY Hall edge hElAngle is overwritten with the nominal edge angle PhaseShift + k*60 deg;
+ *    - between the edges the angle is integrated with the average speed = 60 deg / (mean of the last
+ *      HALL_AVERAGING_FIFO_DEPTH sector periods) and is clamped to +60 deg until the next edge.
+ *  So the angle error is (a) the placement error of the edge that starts the sector (the sensors / magnet are
+ *  not exactly 60 deg apart) and (b) a ramp inside the sector, which appears when the averaging depth is not a
+ *  multiple of 6 (the mean of 4 or 16 sector periods is not the mean of a whole revolution).
+ *
+ *  The module reads HALL_M1.SensorPeriod[] (the library's own FIFO) from the 1 kHz task, takes only NEW entries,
+ *  labels them with the Hall state, and for every complete revolution at steady speed computes the width of each
+ *  sector in electrical degrees (nominal 60.00). From the mean widths it
+ *    - gives the edge errors edge_x100[6] (the table that would remove (a)),
+ *    - PREDICTS the rms and peak-to-peak angle error that the library makes with the present averaging depth and with 6, 12, 18.
+ *  Nothing is changed in the library. Result per phase: g_myDiagHallHist[same index as g_myDiagHist], g_myDiagHallLast.
+ *  Sectors are in the state order 5,1,3,2,6,4 (forward rotation); edge_x100[i] is the error of the edge that
+ *  STARTS sector i = true angle - nominal angle, deg x100, mean removed.
+ *  Compare pred_rms_x100[0] with the measured ripple: id_std / iq_mean = sin(error). If the prediction is much smaller
+ *  than the measured ripple, the Hall edges are not the main cause.
+ * ===================================================================================== */
+#if MYDIAG_HALL_ENABLE
+#if !MYDIAG_ID_ENABLE
+#error MYDIAG_HALL_ENABLE needs MYDIAG_ID_ENABLE (MyDiag_Sat16)
+#endif
+
+typedef struct
+{
+  uint16_t ready;
+  uint16_t n_rev;               /* revolutions used */
+  uint16_t n_skip;              /* revolutions dropped (speed changed) */
+  uint16_t n_lost;              /* sync losses (missed edges / direction change) */
+  uint8_t  N;                   /* HALL_M1.SpeedBufferSize = HALL_AVERAGING_FIFO_DEPTH */
+  uint8_t  pad;
+  int16_t  rpm_mean;
+  int16_t  w_mean_x100[6];      /* sector widths, deg x100, nominal 6000 */
+  int16_t  w_std_x100[6];       /* revolution to revolution spread of the width */
+  int16_t  edge_x100[6];        /* edge errors (true - nominal), deg x100, mean removed */
+  int16_t  edge_rms_x100;       /* rms of the edge errors */
+  int16_t  pred_rms_x100[4];    /* predicted rms angle error for the depth N, 6, 12, 18 (deg x100) */
+  int16_t  pred_pp_x100[4];     /* predicted peak to peak */
+} MyDiagHall_t;
+
+MyDiagHall_t g_myDiagHallHist[MYDIAG_HIST];
+MyDiagHall_t g_myDiagHallLast;
+
+static const uint8_t s_hl_pos[8] = { 255u, 1u, 3u, 2u, 5u, 0u, 4u, 255u };   /* state -> position in the sequence 5,1,3,2,6,4 */
+
+static uint8_t  s_hl_last_idx;
+static bool     s_hl_have;
+static uint8_t  s_hl_last_dpos;
+static uint32_t s_hl_cnt;
+static uint32_t s_hl_d[6];
+static uint32_t s_hl_Sprev;
+static float    s_hl_sum[6];
+static float    s_hl_sum2[6];
+static uint32_t s_hl_nrev, s_hl_nskip, s_hl_nlost;
+static float    s_hl_sum_rpm;
+static int32_t  s_hl_rpm;
+
+static void MyDiag_HallClear(void)
+{
+  s_hl_have = false;
+  s_hl_cnt = 0u;
+  s_hl_Sprev = 0u;
+  memset(s_hl_sum, 0, sizeof(s_hl_sum));
+  memset(s_hl_sum2, 0, sizeof(s_hl_sum2));
+  s_hl_nrev = 0u;
+  s_hl_nskip = 0u;
+  s_hl_nlost = 0u;
+  s_hl_sum_rpm = 0.0f;
+}
+
+static void MyDiag_HallRev(void)
+{
+  uint32_t S = 0u;
+  for (uint8_t p = 0u; p < 6u; p++) { S += s_hl_d[p]; }
+  if (S == 0u) { return; }
+  const uint32_t Sp = s_hl_Sprev;
+  s_hl_Sprev = S;
+  if (Sp != 0u)
+  {
+    const uint32_t diff = (S > Sp) ? (S - Sp) : (Sp - S);
+    if ((diff * 100u) > ((uint32_t)MYDIAG_HALL_REV_TOL_PCT * S)) { s_hl_nskip++; return; }
+  }
+  else
+  {
+    return;                       /* first revolution after a (re)start: no reference yet */
+  }
+  for (uint8_t p = 0u; p < 6u; p++)
+  {
+    const float e = 36000.0f * (float)s_hl_d[p] / (float)S - 6000.0f;      /* deg x100 */
+    s_hl_sum[p] += e;
+    s_hl_sum2[p] += e * e;
+  }
+  s_hl_nrev++;
+  s_hl_sum_rpm += (float)s_hl_rpm;
+}
+
+/* called every ms in RUN */
+static void MyDiag_HallStep(int32_t rpm, int32_t ref_rpm)
+{
+  const uint8_t N = HALL_M1.SpeedBufferSize;
+  if ((N < 2u) || (N > 18u)) { return; }
+  const uint8_t idx1 = *(volatile uint8_t *)&HALL_M1.SpeedFIFOIdx;
+  const uint8_t st1 = *(volatile uint8_t *)&HALL_M1.HallState;
+  const bool steady = (rpm >= MYDIAG_HALL_RPM_MIN) && (abs(rpm - ref_rpm) < MYDIAG_HALL_STEADY_RPM) &&
+                      (*(volatile int8_t *)&HALL_M1.Direction > 0);
+  if ((!steady) || (idx1 >= N))
+  {
+    s_hl_last_idx = idx1;
+    s_hl_have = false;
+    s_hl_cnt = 0u;
+    s_hl_Sprev = 0u;
+    return;
+  }
+  if (!s_hl_have)
+  {
+    s_hl_last_idx = idx1;
+    s_hl_have = true;
+    s_hl_cnt = 0u;
+    s_hl_Sprev = 0u;
+    return;
+  }
+  const uint8_t m = (uint8_t)((idx1 + N - s_hl_last_idx) % N);
+  if (m == 0u) { return; }
+  const uint8_t pos = (st1 < 8u) ? s_hl_pos[st1] : 255u;
+  if (pos == 255u)
+  {
+    s_hl_last_idx = idx1;
+    s_hl_cnt = 0u;
+    s_hl_Sprev = 0u;
+    return;
+  }
+  int32_t buf[18];
+  for (uint8_t a = 0u; a < m; a++)
+  {
+    const uint8_t i = (uint8_t)((idx1 + N - 1u - a) % N);
+    int32_t v = ((volatile int32_t *)HALL_M1.SensorPeriod)[i];
+    buf[a] = (v < 0) ? -v : v;
+  }
+  if ((*(volatile uint8_t *)&HALL_M1.SpeedFIFOIdx != idx1) || (*(volatile uint8_t *)&HALL_M1.HallState != st1))
+  {
+    return;                       /* an edge came while we were reading: try again in 1 ms (m will be larger) */
+  }
+  s_hl_last_idx = idx1;
+  s_hl_rpm = rpm;
+  for (int32_t a = (int32_t)m - 1; a >= 0; a--)    /* oldest new entry first */
+  {
+    /* entry of age a was stored when the state at position (pos-a) was entered; its value is the duration of the state before it */
+    const uint8_t dpos = (uint8_t)((pos + 5u + 6u - ((uint32_t)a % 6u)) % 6u);
+    if ((s_hl_cnt > 0u) && (dpos != (uint8_t)((s_hl_last_dpos + 1u) % 6u)))
+    {
+      s_hl_nlost++;
+      s_hl_cnt = 0u;
+      s_hl_Sprev = 0u;
+    }
+    s_hl_d[dpos] = (uint32_t)buf[a];
+    s_hl_last_dpos = dpos;
+    s_hl_cnt++;
+    if ((s_hl_cnt >= 6u) && ((s_hl_cnt % 6u) == 0u)) { MyDiag_HallRev(); }
+  }
+}
+
+/* predicted angle error of the library for the averaging depth N, from the mean sector widths (deg) and edge errors (deg) */
+static void MyDiag_HallPredict(const float width[6], const float edge[6], uint8_t N, float *rms, float *pp)
+{
+  float sw = 0.0f, sm = 0.0f, mn = 1.0e9f, mx = -1.0e9f;
+  float err[72];
+  float wt[6];
+  for (uint8_t p = 0u; p < 6u; p++)
+  {
+    float wb = 0.0f;
+    for (uint8_t k = 1u; k <= N; k++) { wb += width[(p + 36u - k) % 6u]; }
+    wb /= (float)N;
+    wt[p] = width[p];
+    for (uint8_t j = 0u; j < 12u; j++)
+    {
+      const float sa = ((float)j + 0.5f) / 12.0f * width[p];       /* true angle travelled in the sector */
+      float adv = sa * 60.0f / wb;                                 /* library: average speed integration ... */
+      if (adv > 60.0f) { adv = 60.0f; }                            /* ... clamped at the next edge angle */
+      const float e = adv - sa - edge[p];
+      err[p * 12u + j] = e;
+      sm += e * width[p];
+      sw += width[p];
+      if (e < mn) { mn = e; }
+      if (e > mx) { mx = e; }
+    }
+  }
+  const float mean = sm / sw;
+  float sq = 0.0f;
+  for (uint8_t p = 0u; p < 6u; p++)
+  {
+    for (uint8_t j = 0u; j < 12u; j++)
+    {
+      const float d = err[p * 12u + j] - mean;
+      sq += d * d * wt[p];
+    }
+  }
+  *rms = sqrtf(sq / sw);
+  *pp = mx - mn;
+}
+
+static void MyDiag_HallFinish(uint8_t k)
+{
+  MyDiagHall_t o;
+  memset(&o, 0, sizeof(o));
+  o.N = HALL_M1.SpeedBufferSize;
+  o.n_rev = (s_hl_nrev > 65535u) ? 65535u : (uint16_t)s_hl_nrev;
+  o.n_skip = (s_hl_nskip > 65535u) ? 65535u : (uint16_t)s_hl_nskip;
+  o.n_lost = (s_hl_nlost > 65535u) ? 65535u : (uint16_t)s_hl_nlost;
+  if (s_hl_nrev >= 10u)
+  {
+    const float n = (float)s_hl_nrev;
+    float width[6], edge[6], e[6];
+    float cum = 0.0f, cmean = 0.0f;
+    o.rpm_mean = MyDiag_Sat16(s_hl_sum_rpm / n);
+    for (uint8_t p = 0u; p < 6u; p++)
+    {
+      const float m = s_hl_sum[p] / n;
+      float v = s_hl_sum2[p] / n - m * m;
+      if (v < 0.0f) { v = 0.0f; }
+      o.w_mean_x100[p] = MyDiag_Sat16(6000.0f + m);
+      o.w_std_x100[p] = MyDiag_Sat16(sqrtf(v));
+      width[p] = 60.0f + m / 100.0f;
+      e[p] = cum;                         /* E_p = sum of the deviations of the sectors before p, deg */
+      cmean += cum;
+      cum += m / 100.0f;
+    }
+    cmean /= 6.0f;
+    float sq = 0.0f;
+    for (uint8_t p = 0u; p < 6u; p++)
+    {
+      edge[p] = e[p] - cmean;
+      o.edge_x100[p] = MyDiag_Sat16(edge[p] * 100.0f);
+      sq += edge[p] * edge[p];
+    }
+    o.edge_rms_x100 = MyDiag_Sat16(sqrtf(sq / 6.0f) * 100.0f);
+    const uint8_t ns[4] = { (o.N >= 2u) ? o.N : 6u, 6u, 12u, 18u };
+    for (uint8_t i = 0u; i < 4u; i++)
+    {
+      float r, pp;
+      MyDiag_HallPredict(width, edge, ns[i], &r, &pp);
+      o.pred_rms_x100[i] = MyDiag_Sat16(r * 100.0f);
+      o.pred_pp_x100[i] = MyDiag_Sat16(pp * 100.0f);
+    }
+  }
+  o.ready = 1u;
+  g_myDiagHallHist[k] = o;
+  g_myDiagHallLast = o;
+  MyDiag_HallClear();
+}
+
+#define MyDiag_HallIdle()   do { s_hl_have = false; s_hl_cnt = 0u; s_hl_Sprev = 0u; } while (0)
+
+#else  /* !MYDIAG_HALL_ENABLE */
+#define MyDiag_HallStep(a, b)   ((void)0)
+#define MyDiag_HallFinish(k)    ((void)(k))
+#define MyDiag_HallIdle()       ((void)0)
+#define MyDiag_HallClear()      ((void)0)
+#endif
+
 static PWMC_R3_2_Handle_t *MyDiag_Pwm(void)
 {
   return (PWMC_R3_2_Handle_t *)pwmcHandle[MYDIAG_MOTOR_IDX];  /* cstat !MISRAC2012-Rule-11.3 */
@@ -789,6 +1059,7 @@ void MyDiag_Init(void)
 {
   MyDiag_Reset();
   MyDiag_IdClearAll();
+  MyDiag_HallClear();
 }
 
 /* Call as often as possible. Takes < 1 us, no blocking. */
@@ -804,6 +1075,7 @@ void MyDiag_Step(void)
   if (MCI_GetSTMState(pMCI[MYDIAG_MOTOR_IDX]) != RUN)
   {
     MyDiag_IdIdle();   /* drops the unfinished window and advances the result computation, < 0.2 ms */
+    MyDiag_HallIdle();
     return;
   }
 
@@ -853,6 +1125,7 @@ void MyDiag_Step(void)
     }
     MyDiag_IdSample(vd, vq, (int32_t)Iqd.d, (int32_t)Iqd.q, rpm, ref_rpm, vs,
                     (uint32_t)VBS_GetAvBusVoltage_V(&BusVoltageSensor_M1._Super), (!case1) || est);
+    MyDiag_HallStep(rpm, ref_rpm);
   }
   if (case1)
   {
@@ -986,6 +1259,7 @@ void MyDiag_CycleEnd(void)
     c->idref_mean_s16 = 0;
   }
   c->n_ang_ms = (g_myDiag.n_ang > 65535u) ? 65535u : (uint16_t)g_myDiag.n_ang;
+  MyDiag_HallFinish((uint8_t)(g_myDiagHistCount % MYDIAG_HIST));
   MyDiag_IdBegin((uint8_t)(g_myDiagHistCount % MYDIAG_HIST));   /* identification result goes to g_myDiagIdHist[same index] */
   g_myDiagHistCount++;
   MyDiag_Reset();
