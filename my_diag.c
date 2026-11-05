@@ -37,6 +37,12 @@
  *   speed_at_case23_rpm                     - last speed (0.1 Hz units->rpm) when case23 was seen
  *   Tafter, Half, Tbefore, Tcase2, Tcase3, Tsampling - the values that are really in the handle
  *
+ * v12: PASSIVE IDENTIFICATION (see the block "PASSIVE IDENTIFICATION" below). No new calls are needed:
+ *   MyDiag_Step() collects windows, MyDiag_CycleEnd() starts the computation, the result appears in
+ *   g_myDiagIdLast (and g_myDiagIdHist[same index as g_myDiagHist]) a few ms later, in the Stop state.
+ *   Live Expressions: g_myDiagIdLast.fit[0..3], .L_bin_uH_x10[], .n_bin[], .shift_now_x10, g_myDiagIdAll[0..3].
+ *   Also new in g_myDiagHist: idref_mean_s16 (mean Id reference in the same window as id_mean_s16).
+ *
  * TEST PLAN FOR TRISE
  *   run the same cycle with TRISE_NS=200, then 2000, then 5000. Compare
  *   pct_case23_x10, headroom_min, vs_pct_x10_max. If pct_case23 stays ~0 in all runs
@@ -47,6 +53,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 #include "main.h"
@@ -56,6 +63,8 @@
 #include "pqd_motor_power_measurement.h"
 #include "pwm_curr_fdbk.h"
 #include "r3_2_g4xx_pwm_curr_fdbk.h"
+#include "pmsm_motor_parameters.h"   /* POLE_PAIR_NUM */
+#include "hall_speed_pos_fdbk.h"     /* HALL_M1.PhaseShift (read only) */
 
 /* ---------- configuration ---------- */
 #define MYDIAG_MOTOR_IDX     0u           /* M1 */
@@ -65,6 +74,23 @@
 #define MYDIAG_ANG_IQ_MAX    1400         /* ... and below this |Iq| in s16 digits (about 15 A, scale not verified) */
 #define MYDIAG_ANG_STEADY_RPM 150         /* window only when |speed - speed_ref| < this (steady state) */
 #define MYDIAG_MIN_SAMPLES   200u         /* shorter runs are ignored by MyDiag_CycleEnd */
+
+/* --- passive identification of R, L, lambda(Ke) and the frame angle error (see the block below) --- */
+#define MYDIAG_ID_ENABLE      1
+#define MYDIAG_POLE_PAIRS     POLE_PAIR_NUM   /* 4 BLACK, 7 DOMEL (pmsm_motor_parameters.h) */
+#define MYDIAG_DIGITS_PER_A   91.5f           /* s16 digits of Id/Iq per 1 A (1 mOhm shunt, gain 4.606, 3.3 V, 16 bit) */
+#define MYDIAG_VQD_FS_DIV     1.7320508f      /* Vd/Vq full scale 32767 = Vbus / this (SVPWM linear limit) */
+#define MYDIAG_ID_WIN_MS      64u             /* window length = number of Step() calls (Step must run at 1 kHz) */
+#define MYDIAG_ID_NWIN        192u            /* ring of windows: 12 bytes each (192 -> 2.3 kB, about 12 s of data) */
+#define MYDIAG_ID_RPM_MIN     800             /* ignore slower windows (Hall interpolation, no EMF) */
+#define MYDIAG_ID_SPAN_PCT    8               /* window rejected if max-min speed inside it > this % of the mean */
+#define MYDIAG_ID_STEADY_RPM  300             /* window rejected if |speed - speed_ref| > this at any ms */
+#define MYDIAG_ID_VS_MAX_X10  900             /* window rejected if |Vqd| > 90.0 % of full scale (voltage clipped) */
+#define MYDIAG_ID_MIN_WIN     12u             /* fewer windows -> fit not valid */
+#define MYDIAG_ID_TAU_SPAN_RPM 600            /* 'tau' fit only if the speed range of the windows is wider than this */
+#define MYDIAG_ID_REF_RPM     3500            /* speed for which delta_ref is extrapolated (working speed) */
+#define MYDIAG_USE_HALL_M1    1               /* read the current HALL_M1.PhaseShift for the report */
+#define MYDIAG_USE_IDREF      1               /* log mean Id reference (MCI_GetIqdref) */
 /* ----------------------------------- */
 
 typedef struct
@@ -106,8 +132,11 @@ typedef struct
   volatile uint32_t n_ang;
   volatile float    sum_iq2;           /* sum of squares, for the ripple (std) of Iq / Id */
   volatile float    sum_id2;
+  volatile float    sum_rpm;           /* for the mean speed / bus voltage of the window (Ls estimate) */
+  volatile float    sum_vbus;
   volatile int32_t  sum_iq;
   volatile int32_t  sum_id;
+  volatile int32_t  sum_idref;         /* sum of the Id reference, same window */
   volatile float    sum_pw;            /* sum of PQD average electrical power [W], same window as sum_vd */
 
   volatile uint32_t Tafter;
@@ -144,16 +173,560 @@ typedef struct
   int16_t  vq_mean_s16;      /* mean Vq, same condition */
   int16_t  ang_err_x10;      /* atan2(Vd,Vq) in degrees x10; ~0 = frame aligned */
   uint16_t n_ang_ms;         /* samples used */
+  int16_t  rpm_mean;         /* mean speed in the window, rpm */
+  int16_t  vbus_mean_x10;    /* mean bus voltage in the window, V x10 */
   int16_t  iq_std_s16;       /* ripple (standard deviation) of Iq / Id in the window, digits */
   int16_t  id_std_s16;
   int16_t  iq_mean_s16;      /* mean Iq / Id in the same window (digits) */
   int16_t  id_mean_s16;
   int16_t  pwr_mean_w_x10;   /* mean electrical power [W]x10 in the same window (compare between phase shifts) */
+  int16_t  idref_mean_s16;   /* mean Id REFERENCE in the same window: if it is not 0, Id mean is not an error but a command */
 } MyDiagCycle_t;
 
 #define MYDIAG_HIST 8u
 volatile MyDiagCycle_t g_myDiagHist[MYDIAG_HIST];
 volatile uint32_t g_myDiagHistCount;   /* total number of finished cycles */
+
+/* =====================================================================================
+ *  PASSIVE IDENTIFICATION of R, L, lambda (Ke) and the frame angle error delta
+ *
+ *  Nothing is commanded, the motor is only observed. Every 64 ms of RUN the mean of
+ *  Vd, Vq, Id, Iq and the speed is taken (a "window"); windows with voltage clipping,
+ *  moved sampling point (case 2/3), a speed change > 8 % or no steady speed are dropped.
+ *  The surface PM motor in the controller frame (isotropic, so the formula is exact
+ *  for any frame offset delta):
+ *
+ *      Vd = R*Id - w*L(|I|)*Iq - w*lam*sin(delta)            + vdt*Id/|I|
+ *      Vq = R*Iq + w*L(|I|)*Id + w*lam*cos(delta)            + vdt*Iq/|I|
+ *      delta = delta0 + tau*w   (Hall interpolation + PWM delay, grows with speed)
+ *      L(|I|) = L0 + L1*|I| + L2*|I|^2   (the inductance falls with current, fit[2], fit[3])
+ *
+ *  Unknowns (linear least squares over all windows of a phase, 2 equations per window):
+ *      R [Ohm], L0 [mH], a = lam*sin(delta0), b = lam*cos(delta0) [mWb],
+ *      c = lam*tau, vdt = dead-time / switch drop vector [V], L1 [mH/A], L2 [mH/A^2]
+ *  Four variants are solved:
+ *      fit[0] = R, L, a, b                       (simplest, R includes the dead-time drop, delta is biased by tau)
+ *      fit[1] = R, L, a, b, vdt, tau             (tau only if the speed range of the windows >= 600 rpm)
+ *      fit[2] = R, L0, L1, a, b, vdt, tau        (+ linear fall of L with current)
+ *      fit[3] = R, L0, L1, L2, a, b, vdt, tau    (+ curvature; needs windows from ~10 A up to 100 A, otherwise noisy)
+ *  Take the variant with the smallest residuals res_d/res_q whose numbers are plausible. L at 20 A and 80 A
+ *  of the fitted law are in L20/L80 (equal to L for fit[0], fit[1]).
+ *  All values are for the equivalent star PHASE (L = terminal value / 2, R likewise).
+ *  Ke is given in the units of MOTOR_VOLTAGE_CONSTANT (V rms line-line per krpm).
+ *
+ *  Results (after every finished cycle, ~5 ms later; the same index as g_myDiagHist):
+ *     g_myDiagIdHist[(g_myDiagHistCount-1) % 8]   or   g_myDiagIdLast
+ *     g_myDiagIdAll[4]   - the same fits over ALL cycles since MyDiag_IdClearAll()
+ *  delta_x100 > 0  ->  HALL_PHASE_SHIFT must be INCREASED by that angle (deg) at the mean speed
+ *  of the windows (delta_ref_x100: extrapolated to MYDIAG_ID_REF_RPM, only meaningful for the fits with tau).
+ *  Valid fit has n_win >= 12. If n_win == 0 the fit was not possible (too few windows or singular).
+ *  IMPORTANT: the scale constants (MYDIAG_DIGITS_PER_A, MYDIAG_VQD_FS_DIV) are not verified on the
+ *  real board. Compare ke_x100 with Ke measured by hand (drill + oscilloscope) once.
+ * ===================================================================================== */
+#if MYDIAG_ID_ENABLE
+
+typedef struct { int16_t vd, vq, id, iq, rpm, vbus_x10; } MyDiagWin_t;
+
+typedef struct
+{
+  double   ata[8][8];      /* normal equations, upper triangle used. Unknowns: 0 R, 1 L0, 2 a, 3 b, 4 c(tau), 5 vdt, 6 L1, 7 L2 */
+  double   atb[8];
+  double   btb;
+  double   sum_om;         /* electrical speed [krad/s], summed over windows */
+  double   sum_id;         /* A */
+  uint32_t nw;
+  int32_t  rpm_min;
+  int32_t  rpm_max;
+  int32_t  iq_min_x10;     /* A x10 */
+  int32_t  iq_max_x10;
+} MyDiagNE_t;
+
+typedef struct
+{
+  int16_t n_win;           /* windows used, 0 = fit not valid */
+  int16_t R_mohm_x10;      /* phase R (effective, includes wires and switches), mOhm x10 */
+  int16_t L_uH_x10;        /* phase L (fit[0], fit[1]: constant; fit[2], fit[3]: L0 at zero current), uH x10 */
+  int16_t L_se_uH_x10;     /* its 1-sigma, uH x10 */
+  int16_t L20_uH_x10;      /* L at |I| = 20 A of the fitted law, uH x10 */
+  int16_t L80_uH_x10;      /* L at |I| = 80 A */
+  int16_t ke_x100;         /* V rms line-line per krpm x100 (as MOTOR_VOLTAGE_CONSTANT) */
+  int16_t delta_x100;      /* frame angle error at the mean speed, deg x100; >0: increase HALL_PHASE_SHIFT */
+  int16_t delta_ref_x100;  /* same at MYDIAG_ID_REF_RPM (uses tau; fits 1..3 only) */
+  int16_t delta_se_x100;   /* 1-sigma of delta, deg x100 */
+  int16_t tau_us;          /* speed dependent lag, us (fits 1..3) */
+  int16_t vdt_mv;          /* dead-time / drop voltage, mV (fits 1..3) */
+  int16_t res_d_mv;        /* rms residual of the d equation over the stored windows, mV */
+  int16_t res_q_mv;        /* same for q */
+} MyDiagFit_t;
+
+typedef struct
+{
+  MyDiagFit_t fit[4];
+  uint16_t ready;          /* 1 when finished */
+  uint16_t n_win;          /* accepted windows of the phase */
+  uint16_t n_rej;          /* rejected windows (clipping, ramp, case 2/3 ...) */
+  uint16_t n_lost;         /* windows skipped because the previous result was still being computed */
+  int16_t  rpm_min, rpm_max, rpm_mean;
+  int16_t  iq_min_x10;     /* range of Iq over the windows, A x10 (the wider the better for L) */
+  int16_t  iq_max_x10;
+  int16_t  id_mean_x10;    /* A x10 */
+  int16_t  shift_now_x10;  /* HALL_M1.PhaseShift at the moment of the report, deg x10 */
+  int16_t  L_bin_uH_x10[4];/* L from the windows with |Iq| in 5-20, 20-40, 40-70, >70 A (saturation), uH x10 */
+  uint16_t n_bin[4];
+} MyDiagId_t;
+
+MyDiagId_t  g_myDiagIdHist[MYDIAG_HIST];
+MyDiagId_t  g_myDiagIdLast;
+MyDiagFit_t g_myDiagIdAll[4];
+volatile uint32_t g_myDiagIdSeq;     /* +1 every time a result is finished */
+
+static const uint8_t s_mask[4] = { 0x0Fu, 0x3Fu, 0x7Fu, 0xFFu };   /* bit0 R, bit1 L0, bit2 a, bit3 b, bit4 c(tau), bit5 vdt, bit6 L1, bit7 L2 */
+static const float   s_bin_edge[5] = { 5.0f, 20.0f, 40.0f, 70.0f, 1.0e6f };
+
+static MyDiagNE_t  s_ph;                       /* current phase (since the last finished cycle) */
+static MyDiagNE_t  s_all;                      /* all phases */
+static MyDiagWin_t s_win[MYDIAG_ID_NWIN];      /* ring of the windows of the current phase */
+static uint16_t    s_win_n;
+static uint16_t    s_win_w;
+static uint16_t    s_rej, s_lost;
+static uint8_t     s_id_stage;                 /* 0 = idle, 1..11 = computing the result of the finished cycle */
+static uint8_t     s_id_k;
+static float       s_par[4][8];
+static float       s_cov[4][8];
+static bool        s_ok[4];
+static uint8_t     s_msk[4];                   /* mask really used (tau dropped when the speed range is narrow) */
+static MyDiagId_t  s_idout;
+
+/* running window */
+static struct
+{
+  int32_t  sum_vd, sum_vq, sum_id, sum_iq, sum_rpm;
+  uint32_t sum_vbus;
+  uint32_t n;
+  int32_t  rpm_min, rpm_max;
+  uint32_t vs_max;
+  uint32_t dev_max;
+  bool     bad;
+} s_w;
+
+static int16_t MyDiag_Sat16(float v)
+{
+  if (!(v == v)) { return 0; }
+  if (v > 32767.0f) { return 32767; }
+  if (v < -32768.0f) { return -32768; }
+  return (int16_t)(v + ((v >= 0.0f) ? 0.5f : -0.5f));
+}
+
+/* window means -> physical units (V, A, krad/s electrical) and the dead-time direction */
+static void MyDiag_IdPhys(const MyDiagWin_t *w, float *Vd, float *Vq, float *Id, float *Iq, float *om, float *ud, float *uq)
+{
+  const float vsc = (((float)w->vbus_x10 * 0.1f) / MYDIAG_VQD_FS_DIV) / 32767.0f;
+  *Vd = (float)w->vd * vsc;
+  *Vq = (float)w->vq * vsc;
+  *Id = (float)w->id / MYDIAG_DIGITS_PER_A;
+  *Iq = (float)w->iq / MYDIAG_DIGITS_PER_A;
+  *om = (float)w->rpm * (6.28318531f / 60.0f) * (float)MYDIAG_POLE_PAIRS * 0.001f;
+  const float im = sqrtf((*Id) * (*Id) + (*Iq) * (*Iq));
+  *ud = (im > 3.0f) ? (*Id / im) : 0.0f;
+  *uq = (im > 3.0f) ? (*Iq / im) : 0.0f;
+}
+
+static void MyDiag_NeAddRow(MyDiagNE_t *ne, const double r[8], double y)
+{
+  for (int i = 0; i < 8; i++)
+  {
+    ne->atb[i] += r[i] * y;
+    for (int j = i; j < 8; j++)
+    {
+      ne->ata[i][j] += r[i] * r[j];
+    }
+  }
+  ne->btb += y * y;
+}
+
+static void MyDiag_NeAddWindow(MyDiagNE_t *ne, const MyDiagWin_t *w)
+{
+  float Vd, Vq, Id, Iq, om, ud, uq;
+  MyDiag_IdPhys(w, &Vd, &Vq, &Id, &Iq, &om, &ud, &uq);
+  const double im = sqrt((double)Id * Id + (double)Iq * Iq);
+  const double rd[8] = { Id, -(double)om * Iq, -(double)om, 0.0, -(double)om * om, ud, -(double)om * im * Iq, -(double)om * im * im * Iq };   /* unknowns: R L0 a b c vdt L1 L2 */
+  const double rq[8] = { Iq,  (double)om * Id,  0.0, (double)om, 0.0, uq,  (double)om * im * Id,  (double)om * im * im * Id };
+  MyDiag_NeAddRow(ne, rd, Vd);
+  MyDiag_NeAddRow(ne, rq, Vq);
+
+  const int32_t iq10 = (int32_t)(Iq * 10.0f);
+  if (ne->nw == 0u)
+  {
+    ne->rpm_min = w->rpm; ne->rpm_max = w->rpm; ne->iq_min_x10 = iq10; ne->iq_max_x10 = iq10;
+  }
+  else
+  {
+    if (w->rpm < ne->rpm_min) { ne->rpm_min = w->rpm; }
+    if (w->rpm > ne->rpm_max) { ne->rpm_max = w->rpm; }
+    if (iq10 < ne->iq_min_x10) { ne->iq_min_x10 = iq10; }
+    if (iq10 > ne->iq_max_x10) { ne->iq_max_x10 = iq10; }
+  }
+  ne->sum_om += om;
+  ne->sum_id += Id;
+  ne->nw++;
+}
+
+static void MyDiag_NeMerge(MyDiagNE_t *dst, const MyDiagNE_t *src)
+{
+  if (src->nw == 0u) { return; }
+  for (int i = 0; i < 8; i++)
+  {
+    dst->atb[i] += src->atb[i];
+    for (int j = i; j < 8; j++) { dst->ata[i][j] += src->ata[i][j]; }
+  }
+  dst->btb += src->btb;
+  dst->sum_om += src->sum_om;
+  dst->sum_id += src->sum_id;
+  if (dst->nw == 0u)
+  {
+    dst->rpm_min = src->rpm_min; dst->rpm_max = src->rpm_max;
+    dst->iq_min_x10 = src->iq_min_x10; dst->iq_max_x10 = src->iq_max_x10;
+  }
+  else
+  {
+    if (src->rpm_min < dst->rpm_min) { dst->rpm_min = src->rpm_min; }
+    if (src->rpm_max > dst->rpm_max) { dst->rpm_max = src->rpm_max; }
+    if (src->iq_min_x10 < dst->iq_min_x10) { dst->iq_min_x10 = src->iq_min_x10; }
+    if (src->iq_max_x10 > dst->iq_max_x10) { dst->iq_max_x10 = src->iq_max_x10; }
+  }
+  dst->nw += src->nw;
+}
+
+/* Least squares for the unknowns selected by mask. The normal matrix is scaled to a unit diagonal and
+ * inverted with Gauss-Jordan in float (FPU, microseconds). p = solution, cov = diagonal of the inverse
+ * (multiply by the residual variance to get the variance of the parameter). */
+static bool MyDiag_IdSolve(const MyDiagNE_t *ne, uint8_t mask, float p[8], float cov[8])
+{
+  uint8_t idx[8];
+  uint8_t k = 0u;
+  for (uint8_t i = 0u; i < 8u; i++)
+  {
+    p[i] = 0.0f;
+    cov[i] = 0.0f;
+    if (((mask >> i) & 1u) != 0u) { idx[k++] = i; }
+  }
+  if (ne->nw < MYDIAG_ID_MIN_WIN) { return false; }
+
+  double d[8];
+  for (uint8_t j = 0u; j < k; j++)
+  {
+    const double dj = ne->ata[idx[j]][idx[j]];
+    if (dj < 1.0e-9) { return false; }
+    d[j] = 1.0 / sqrt(dj);
+  }
+  float m[8][16];
+  float rhs[8];
+  for (uint8_t j = 0u; j < k; j++)
+  {
+    for (uint8_t l = 0u; l < k; l++)
+    {
+      const double a = (idx[j] <= idx[l]) ? ne->ata[idx[j]][idx[l]] : ne->ata[idx[l]][idx[j]];
+      m[j][l] = (float)(a * d[j] * d[l]);
+      m[j][k + l] = (j == l) ? 1.0f : 0.0f;
+    }
+    rhs[j] = (float)(ne->atb[idx[j]] * d[j]);
+  }
+  for (uint8_t c = 0u; c < k; c++)
+  {
+    uint8_t pr = c;
+    for (uint8_t r = (uint8_t)(c + 1u); r < k; r++)
+    {
+      if (fabsf(m[r][c]) > fabsf(m[pr][c])) { pr = r; }
+    }
+    if (fabsf(m[pr][c]) < 1.0e-6f) { return false; }          /* singular: not enough excitation */
+    if (pr != c)
+    {
+      for (uint8_t l = 0u; l < (uint8_t)(2u * k); l++) { const float t = m[c][l]; m[c][l] = m[pr][l]; m[pr][l] = t; }
+      const float t = rhs[c]; rhs[c] = rhs[pr]; rhs[pr] = t;
+    }
+    const float pv = m[c][c];
+    for (uint8_t l = 0u; l < (uint8_t)(2u * k); l++) { m[c][l] /= pv; }
+    rhs[c] /= pv;
+    for (uint8_t r = 0u; r < k; r++)
+    {
+      if (r == c) { continue; }
+      const float f = m[r][c];
+      if (f == 0.0f) { continue; }
+      for (uint8_t l = 0u; l < (uint8_t)(2u * k); l++) { m[r][l] -= f * m[c][l]; }
+      rhs[r] -= f * rhs[c];
+    }
+  }
+  for (uint8_t j = 0u; j < k; j++)
+  {
+    p[idx[j]] = (float)((double)rhs[j] * d[j]);
+    cov[idx[j]] = (float)((double)m[j][k + j] * d[j] * d[j]);
+  }
+  return true;
+}
+
+/* rms residual of the model over the stored windows, in volts (d and q separately) */
+static float MyDiag_IdResidual(const float p[8], float *res_d, float *res_q)
+{
+  double sd = 0.0, sq = 0.0;
+  for (uint16_t i = 0u; i < s_win_n; i++)
+  {
+    float Vd, Vq, Id, Iq, om, ud, uq;
+    MyDiag_IdPhys(&s_win[i], &Vd, &Vq, &Id, &Iq, &om, &ud, &uq);
+    const float im = sqrtf(Id * Id + Iq * Iq);
+    const float L = p[1] + p[6] * im + p[7] * im * im;
+    const float pd = p[0] * Id - om * L * Iq - om * p[2] - om * om * p[4] + p[5] * ud;
+    const float pq = p[0] * Iq + om * L * Id + om * p[3] + p[5] * uq;
+    sd += (double)((Vd - pd) * (Vd - pd));
+    sq += (double)((Vq - pq) * (Vq - pq));
+  }
+  const float n = (float)((s_win_n > 0u) ? s_win_n : 1u);
+  *res_d = sqrtf((float)sd / n);
+  *res_q = sqrtf((float)sq / n);
+  return ((float)(sd + sq)) / (2.0f * n);        /* residual variance per equation, V^2 */
+}
+
+static void MyDiag_IdFillFit(MyDiagFit_t *f, const MyDiagNE_t *ne, const float p[8], const float cov[8], float sigma2,
+                             uint8_t mask, float res_d, float res_q)
+{
+  const float rad2deg = 57.2957795f;
+  const float om_mean = (float)(ne->sum_om / (double)ne->nw);
+  const float om_ref = (float)MYDIAG_ID_REF_RPM * (6.28318531f / 60.0f) * (float)MYDIAG_POLE_PAIRS * 0.001f;
+  const float lam = hypotf(p[2], p[3]);                      /* mWb */
+  f->n_win = (ne->nw > 32767u) ? 32767 : (int16_t)ne->nw;
+  f->R_mohm_x10 = MyDiag_Sat16(p[0] * 1000.0f * 10.0f);
+  f->L_uH_x10 = MyDiag_Sat16(p[1] * 1000.0f * 10.0f);
+  f->L_se_uH_x10 = MyDiag_Sat16(sqrtf(sigma2 * cov[1]) * 1000.0f * 10.0f);
+  f->L20_uH_x10 = MyDiag_Sat16((p[1] + p[6] * 20.0f + p[7] * 400.0f) * 1000.0f * 10.0f);
+  f->L80_uH_x10 = MyDiag_Sat16((p[1] + p[6] * 80.0f + p[7] * 6400.0f) * 1000.0f * 10.0f);
+  f->ke_x100 = MyDiag_Sat16(lam * 1.0e-3f * (6.28318531f / 60.0f) * 1000.0f * (float)MYDIAG_POLE_PAIRS * 1.22474487f * 100.0f);
+  f->delta_x100 = MyDiag_Sat16(atan2f(p[2] + p[4] * om_mean, p[3]) * rad2deg * 100.0f);
+  f->delta_ref_x100 = MyDiag_Sat16(atan2f(p[2] + p[4] * om_ref, p[3]) * rad2deg * 100.0f);
+  f->delta_se_x100 = (lam > 0.0f) ? MyDiag_Sat16(sqrtf(sigma2 * cov[2]) / lam * rad2deg * 100.0f) : 0;
+  f->tau_us = (((mask & 0x10u) != 0u) && (p[3] != 0.0f)) ? MyDiag_Sat16(p[4] / p[3] * 1000.0f) : 0;
+  f->vdt_mv = MyDiag_Sat16(p[5] * 1000.0f);
+  f->res_d_mv = MyDiag_Sat16(res_d * 1000.0f);
+  f->res_q_mv = MyDiag_Sat16(res_q * 1000.0f);
+}
+
+static void MyDiag_IdClearPhase(void)
+{
+  memset(&s_ph, 0, sizeof(s_ph));
+  s_win_n = 0u;
+  s_win_w = 0u;
+  s_rej = 0u;
+  s_lost = 0u;
+  s_w.n = 0u;
+}
+
+void MyDiag_IdClearAll(void)
+{
+  memset(&s_all, 0, sizeof(s_all));
+  memset(g_myDiagIdAll, 0, sizeof(g_myDiagIdAll));
+  MyDiag_IdClearPhase();
+  s_id_stage = 0u;
+}
+
+static void MyDiag_IdWindowDone(void)
+{
+  const int32_t n = (int32_t)s_w.n;
+  const int32_t rpm_mean = s_w.sum_rpm / n;
+  const int32_t span = s_w.rpm_max - s_w.rpm_min;
+  const bool ok = (!s_w.bad) && (rpm_mean >= MYDIAG_ID_RPM_MIN) &&
+                  ((span * 100) <= (MYDIAG_ID_SPAN_PCT * rpm_mean)) &&
+                  (s_w.dev_max <= (uint32_t)MYDIAG_ID_STEADY_RPM) &&
+                  ((s_w.vs_max * 1000u) <= ((uint32_t)MYDIAG_ID_VS_MAX_X10 * 32767u));
+  if (!ok)
+  {
+    s_rej++;
+    return;
+  }
+  MyDiagWin_t w;
+  w.vd = (int16_t)(s_w.sum_vd / n);
+  w.vq = (int16_t)(s_w.sum_vq / n);
+  w.id = (int16_t)(s_w.sum_id / n);
+  w.iq = (int16_t)(s_w.sum_iq / n);
+  w.rpm = (int16_t)rpm_mean;
+  w.vbus_x10 = (int16_t)((s_w.sum_vbus * 10u) / s_w.n);
+  s_win[s_win_w] = w;
+  s_win_w = (uint16_t)((s_win_w + 1u) % MYDIAG_ID_NWIN);
+  if (s_win_n < MYDIAG_ID_NWIN) { s_win_n++; }
+  MyDiag_NeAddWindow(&s_ph, &w);
+}
+
+/* one call per ms, only in state RUN */
+static void MyDiag_IdSample(int32_t vd, int32_t vq, int32_t id, int32_t iq, int32_t rpm, int32_t ref_rpm, uint32_t vs,
+                            uint32_t vbus_v, bool bad)
+{
+  if (s_id_stage != 0u)
+  {
+    s_lost++;                    /* previous result still being computed (a few ms), skip */
+    return;
+  }
+  if (s_w.n == 0u)
+  {
+    memset(&s_w, 0, sizeof(s_w));
+    s_w.rpm_min = rpm;
+    s_w.rpm_max = rpm;
+  }
+  s_w.sum_vd += vd;
+  s_w.sum_vq += vq;
+  s_w.sum_id += id;
+  s_w.sum_iq += iq;
+  s_w.sum_rpm += rpm;
+  s_w.sum_vbus += vbus_v;
+  if (rpm < s_w.rpm_min) { s_w.rpm_min = rpm; }
+  if (rpm > s_w.rpm_max) { s_w.rpm_max = rpm; }
+  if (vs > s_w.vs_max) { s_w.vs_max = vs; }
+  const uint32_t dev = (uint32_t)abs(rpm - ref_rpm);
+  if (dev > s_w.dev_max) { s_w.dev_max = dev; }
+  if (bad) { s_w.bad = true; }
+  s_w.n++;
+  if (s_w.n >= MYDIAG_ID_WIN_MS)
+  {
+    MyDiag_IdWindowDone();
+    s_w.n = 0u;
+  }
+}
+
+/* variant v >= 1 solves for tau only when the windows cover a wide speed range (otherwise tau is not separable from delta0) */
+static uint8_t MyDiag_IdMask(uint8_t v, const MyDiagNE_t *ne)
+{
+  uint8_t m = s_mask[v];
+  if ((v >= 1u) && ((ne->rpm_max - ne->rpm_min) < MYDIAG_ID_TAU_SPAN_RPM)) { m &= (uint8_t)~0x10u; }
+  return m;
+}
+
+/* One stage per call (each < 0.2 ms) so that the 1 kHz task never overruns. Called from Step() in all
+ * states except RUN and from the early-return path of CycleEnd(), i.e. many times in the Stop state. */
+void MyDiag_IdWork(void)
+{
+  switch (s_id_stage)
+  {
+    case 0:
+      return;
+
+    case 1:   /* statistics of the phase that has just finished */
+    {
+      memset(&s_idout, 0, sizeof(s_idout));
+      memset(s_ok, 0, sizeof(s_ok));
+      s_idout.n_win = (s_ph.nw > 65535u) ? 65535u : (uint16_t)s_ph.nw;
+      s_idout.n_rej = s_rej;
+      s_idout.n_lost = s_lost;
+      if (s_ph.nw > 0u)
+      {
+        s_idout.rpm_min = (int16_t)s_ph.rpm_min;
+        s_idout.rpm_max = (int16_t)s_ph.rpm_max;
+        s_idout.rpm_mean = MyDiag_Sat16((float)(s_ph.sum_om * 1000.0 / (6.28318531 / 60.0 * (double)MYDIAG_POLE_PAIRS) / (double)s_ph.nw));
+        s_idout.iq_min_x10 = MyDiag_Sat16((float)s_ph.iq_min_x10);
+        s_idout.iq_max_x10 = MyDiag_Sat16((float)s_ph.iq_max_x10);
+        s_idout.id_mean_x10 = MyDiag_Sat16((float)(s_ph.sum_id / (double)s_ph.nw * 10.0));
+      }
+#if MYDIAG_USE_HALL_M1
+      {
+        int32_t sh = ((int32_t)HALL_M1.PhaseShift * 3600) / 65536;
+        if (sh < 0) { sh += 3600; }
+        s_idout.shift_now_x10 = (int16_t)sh;
+      }
+#endif
+      s_id_stage = (s_ph.nw >= MYDIAG_ID_MIN_WIN) ? 2u : 6u;
+      break;
+    }
+
+    case 2:
+    case 3:
+    case 4:
+    case 5:   /* variant 0, 1, 2, 3: solve, residual (sigma), final numbers */
+    {
+      const uint8_t v = (uint8_t)(s_id_stage - 2u);
+      s_msk[v] = MyDiag_IdMask(v, &s_ph);
+      s_ok[v] = MyDiag_IdSolve(&s_ph, s_msk[v], s_par[v], s_cov[v]);
+      if (s_ok[v])
+      {
+        float rd, rq;
+        const float sigma2 = MyDiag_IdResidual(s_par[v], &rd, &rq);
+        MyDiag_IdFillFit(&s_idout.fit[v], &s_ph, s_par[v], s_cov[v], sigma2, s_msk[v], rd, rq);
+      }
+      s_id_stage++;
+      break;
+    }
+
+    case 6:   /* saturation bins of the best variant, add the phase to the all-cycles sums */
+    {
+      const int8_t bv = s_ok[3] ? 3 : (s_ok[2] ? 2 : (s_ok[1] ? 1 : (s_ok[0] ? 0 : -1)));
+      if (bv >= 0)
+      {
+        const float *p = s_par[bv];
+        float sum[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        uint16_t cnt[4] = { 0u, 0u, 0u, 0u };
+        for (uint16_t i = 0u; i < s_win_n; i++)
+        {
+          float Vd, Vq, Id, Iq, om, ud, uq;
+          MyDiag_IdPhys(&s_win[i], &Vd, &Vq, &Id, &Iq, &om, &ud, &uq);
+          const float aiq = fabsf(Iq);
+          if ((aiq < s_bin_edge[0]) || (om < 0.2f)) { continue; }
+          const float lmh = (p[0] * Id - om * p[2] - om * om * p[4] + p[5] * ud - Vd) / (om * Iq);   /* apparent L of this window */
+          for (uint8_t b = 0u; b < 4u; b++)
+          {
+            if ((aiq >= s_bin_edge[b]) && (aiq < s_bin_edge[b + 1u])) { sum[b] += lmh; cnt[b]++; break; }
+          }
+        }
+        for (uint8_t b = 0u; b < 4u; b++)
+        {
+          s_idout.n_bin[b] = cnt[b];
+          s_idout.L_bin_uH_x10[b] = (cnt[b] > 0u) ? MyDiag_Sat16(sum[b] / (float)cnt[b] * 1.0e4f) : 0;
+        }
+      }
+      MyDiag_NeMerge(&s_all, &s_ph);
+      s_id_stage = 7u;
+      break;
+    }
+
+    case 7:
+    case 8:
+    case 9:
+    case 10:  /* the same four fits over all phases (no sigma / residual: those fields stay 0) */
+    {
+      const uint8_t v = (uint8_t)(s_id_stage - 7u);
+      float p[8], cv[8];
+      memset(&g_myDiagIdAll[v], 0, sizeof(MyDiagFit_t));
+      const uint8_t mk = MyDiag_IdMask(v, &s_all);
+      if (MyDiag_IdSolve(&s_all, mk, p, cv)) { MyDiag_IdFillFit(&g_myDiagIdAll[v], &s_all, p, cv, 0.0f, mk, 0.0f, 0.0f); }
+      s_id_stage++;
+      break;
+    }
+
+    case 11:
+    default:  /* publish */
+    {
+      s_idout.ready = 1u;
+      g_myDiagIdHist[s_id_k] = s_idout;
+      g_myDiagIdLast = s_idout;
+      g_myDiagIdSeq++;
+      MyDiag_IdClearPhase();
+      s_id_stage = 0u;
+      break;
+    }
+  }
+}
+
+/* called by CycleEnd() when a phase has been recorded in g_myDiagHist[k] */
+static void MyDiag_IdBegin(uint8_t k)
+{
+  if (s_id_stage != 0u) { return; }     /* previous result not finished: this phase is not evaluated */
+  s_id_k = k;
+  g_myDiagIdHist[k].ready = 0u;
+  s_id_stage = 1u;
+}
+
+#define MyDiag_IdIdle()  do { s_w.n = 0u; MyDiag_IdWork(); } while (0)
+
+#else  /* !MYDIAG_ID_ENABLE */
+#define MyDiag_IdIdle()                          ((void)0)
+#define MyDiag_IdBegin(k)                        ((void)(k))
+#define MyDiag_IdSample(a, b, c, d, e, f, g, h, i) ((void)0)
+#define MyDiag_IdClearAll()                      ((void)0)
+#define MyDiag_IdWork()                          ((void)0)
+#endif
 
 static PWMC_R3_2_Handle_t *MyDiag_Pwm(void)
 {
@@ -194,9 +767,12 @@ void MyDiag_Reset(void)
   g_myDiag.n_ang = 0u;
   g_myDiag.sum_pw = 0.0f;
   g_myDiag.sum_iq = 0;
+  g_myDiag.sum_rpm = 0.0f;
+  g_myDiag.sum_vbus = 0.0f;
   g_myDiag.sum_iq2 = 0.0f;
   g_myDiag.sum_id2 = 0.0f;
   g_myDiag.sum_id = 0;
+  g_myDiag.sum_idref = 0;
 
   if ((h != NULL) && (h->pParams_str != NULL))
   {
@@ -212,6 +788,7 @@ void MyDiag_Reset(void)
 void MyDiag_Init(void)
 {
   MyDiag_Reset();
+  MyDiag_IdClearAll();
 }
 
 /* Call as often as possible. Takes < 1 us, no blocking. */
@@ -226,6 +803,7 @@ void MyDiag_Step(void)
   /* count only while the motor really runs (otherwise Stop/Wait pollute the statistic) */
   if (MCI_GetSTMState(pMCI[MYDIAG_MOTOR_IDX]) != RUN)
   {
+    MyDiag_IdIdle();   /* drops the unfinished window and advances the result computation, < 0.2 ms */
     return;
   }
 
@@ -263,11 +841,18 @@ void MyDiag_Step(void)
       g_myDiag.sum_vq += vq;
       g_myDiag.n_ang++;
       g_myDiag.sum_iq += (int32_t)Iqd.q;
+      g_myDiag.sum_rpm += (float)rpm;
+      g_myDiag.sum_vbus += (float)VBS_GetAvBusVoltage_V(&BusVoltageSensor_M1._Super);
       g_myDiag.sum_iq2 += (float)((int32_t)Iqd.q * (int32_t)Iqd.q);
       g_myDiag.sum_id2 += (float)((int32_t)Iqd.d * (int32_t)Iqd.d);
       g_myDiag.sum_id += (int32_t)Iqd.d;
       g_myDiag.sum_pw += PQD_GetAvrgElMotorPowerW(pMPM[MYDIAG_MOTOR_IDX]);
+#if MYDIAG_USE_IDREF
+      g_myDiag.sum_idref += (int32_t)MCI_GetIqdref(pMCI[MYDIAG_MOTOR_IDX]).d;
+#endif
     }
+    MyDiag_IdSample(vd, vq, (int32_t)Iqd.d, (int32_t)Iqd.q, rpm, ref_rpm, vs,
+                    (uint32_t)VBS_GetAvBusVoltage_V(&BusVoltageSensor_M1._Super), (!case1) || est);
   }
   if (case1)
   {
@@ -337,6 +922,7 @@ void MyDiag_CycleEnd(void)
   /* Stop state is executed ~1000 times (relief pulse): record only real runs, once */
   if (g_myDiag.n_total < MYDIAG_MIN_SAMPLES)
   {
+    MyDiag_IdWork();   /* the Stop state calls this ~1000 times: the identification result is computed here */
     return;
   }
   volatile MyDiagCycle_t *c = &g_myDiagHist[g_myDiagHistCount % MYDIAG_HIST];
@@ -369,7 +955,10 @@ void MyDiag_CycleEnd(void)
     c->ang_err_x10 = (int16_t)(atan2f(vdm, vqm) * (1800.0f / 3.14159265f));
     c->pwr_mean_w_x10 = (int16_t)(g_myDiag.sum_pw / (float)g_myDiag.n_ang * 10.0f);
     c->iq_mean_s16 = (int16_t)(g_myDiag.sum_iq / (int32_t)g_myDiag.n_ang);
+    c->rpm_mean = (int16_t)(g_myDiag.sum_rpm / (float)g_myDiag.n_ang);
+    c->vbus_mean_x10 = (int16_t)(g_myDiag.sum_vbus / (float)g_myDiag.n_ang * 10.0f);
     c->id_mean_s16 = (int16_t)(g_myDiag.sum_id / (int32_t)g_myDiag.n_ang);
+    c->idref_mean_s16 = (int16_t)(g_myDiag.sum_idref / (int32_t)g_myDiag.n_ang);
     {
       const float n = (float)g_myDiag.n_ang;
       const float mq = (float)g_myDiag.sum_iq / n;
@@ -389,11 +978,15 @@ void MyDiag_CycleEnd(void)
     c->ang_err_x10 = 0;
     c->pwr_mean_w_x10 = 0;
     c->iq_mean_s16 = 0;
+    c->rpm_mean = 0;
+    c->vbus_mean_x10 = 0;
     c->id_mean_s16 = 0;
     c->iq_std_s16 = 0;
     c->id_std_s16 = 0;
+    c->idref_mean_s16 = 0;
   }
   c->n_ang_ms = (g_myDiag.n_ang > 65535u) ? 65535u : (uint16_t)g_myDiag.n_ang;
+  MyDiag_IdBegin((uint8_t)(g_myDiagHistCount % MYDIAG_HIST));   /* identification result goes to g_myDiagIdHist[same index] */
   g_myDiagHistCount++;
   MyDiag_Reset();
 }
